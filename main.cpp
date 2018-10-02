@@ -345,8 +345,14 @@ int main(int argc, char** argv) {
 	int strm_idx = -1;
 
 	AVDictionary *options = NULL;
-//	const char* url = "rtsp://admin:123456@172.20.73.42";
-	const char* url = "rtsp://admin:123456@172.20.73.42/media/video2";
+	const char* url;
+	if (argc == 1) {
+//		url = "rtsp://admin:123456@172.20.73.42";
+		url = "rtsp://admin:123456@172.20.73.42/media/video2";
+	} else {
+		url = argv[1];
+	}
+	std::cout << "Playing url = \"" << url << "\" ..." << std::endl;
 	av_dict_set(&options, "stimeout", "5000000", 0); // 5 seconds in microseconds
 	int ret = avformat_open_input(&input, url, NULL, &options);
 	av_dict_free(&options);
