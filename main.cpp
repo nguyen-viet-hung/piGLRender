@@ -5,6 +5,8 @@
  *      Author: HungNV
  */
 
+#ifdef USING_OPENGL
+
 #define GL_GLEXT_PROTOTYPES
 #include <GL/glu.h>
 #include <GL/glx.h>
@@ -14,6 +16,33 @@
 #include <string>
 #include <string.h>
 #include <fstream>
+
+#else
+#include <assert.h>
+#include <sys/time.h>
+#include <bcm_host.h>
+
+#ifndef ALIGN_UP
+#define ALIGN_UP(x,y)  ((x + (y)-1) & ~((y)-1))
+#endif
+
+typedef struct
+{
+    DISPMANX_DISPLAY_HANDLE_T   display;
+    DISPMANX_MODEINFO_T         info;
+    void                       *image;
+    DISPMANX_UPDATE_HANDLE_T    update;
+    DISPMANX_RESOURCE_HANDLE_T  resource0;
+    DISPMANX_RESOURCE_HANDLE_T  resource1;
+    uint32_t                    vc_image_ptr0;
+    uint32_t                    vc_image_ptr1;
+    DISPMANX_ELEMENT_HANDLE_T   element;
+
+} RECT_VARS_T;
+
+RECT_VARS_T  gRectVars;
+#endif
+
 #include <iostream>
 #include <stdio.h>
 #include <unistd.h>
@@ -29,6 +58,13 @@ extern "C" {
 #ifdef __cplusplus
 }
 #endif
+
+unsigned long w, h, ws_w, ws_h;
+unsigned char* localVideoBufferDrawer;
+unsigned char* in_buff;
+#define INBUF_SIZE 1024*1024
+
+#ifdef USING_OPENGL
 
 // for OpenGL
 GLuint vertexShader;
@@ -164,11 +200,6 @@ int InitGL() {// All Setup For OpenGL Goes Here
 	return GL_TRUE;							// Initialization Went OK
 }
 
-unsigned long w, h, ws_w, ws_h;
-unsigned char* localVideoBufferDrawer;
-unsigned char* in_buff;
-#define INBUF_SIZE 1024*1024
-
 int DrawGLScene() {	// Here's Where We Do All The Drawing
 	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);     // Clear The Screen And The Depth Buffer
 	glMatrixMode(GL_PROJECTION);
@@ -244,10 +275,17 @@ int DrawGLScene() {	// Here's Where We Do All The Drawing
     return GL_TRUE;                                // Everything Went OK
 }
 
+void reshape(int w, int h)
+{
+    ws_w = w;
+    ws_h = h;
+    glViewport(0, 0, w, h);
+}
+
 int RenderAVFrame(AVFrame* frame, int &justifiedHeight) {
 	if((w != frame->width) || (h != frame->height)) {
 		w = frame->width;
-		w = frame->height;
+		h = frame->height;
 
 		if(localVideoBufferDrawer)
 			delete[] localVideoBufferDrawer;
@@ -318,24 +356,160 @@ int RenderAVFrame(AVFrame* frame, int &justifiedHeight) {
 	return 0;
 }
 
-void reshape(int w, int h)
-{
-    ws_w = w;
-    ws_h = h;
-    glViewport(0, 0, w, h);
+#else
+
+VC_RECT_T       src_rect;
+VC_RECT_T       dst_rect_res;
+VC_RECT_T       dst_rect_elem;
+VC_IMAGE_TYPE_T type = VC_IMAGE_YUV420;
+int pitch;
+int aligned_height;
+
+int OpenDisplay(int w, int h) {
+	RECT_VARS_T    *vars;
+	uint32_t        screen = 0;
+	int             ret;
+	// separate destination rectangles for the resource and for the element
+	pitch = ALIGN_UP(w, 32);
+	aligned_height = ALIGN_UP(h, 16);
+	VC_DISPMANX_ALPHA_T alpha = {
+			(DISPMANX_FLAGS_ALPHA_T)(DISPMANX_FLAGS_ALPHA_FROM_SOURCE | DISPMANX_FLAGS_ALPHA_FIXED_ALL_PIXELS),
+			255, /* fully opaque */
+			0
+	};
+
+	vars = &gRectVars;
+
+	bcm_host_init();
+
+	printf("Open display[%i]...\n", screen );
+	vars->display = vc_dispmanx_display_open( screen );
+
+	ret = vc_dispmanx_display_get_info( vars->display, &vars->info);
+	assert(ret == 0);
+	printf( "Display is %d x %d\n", vars->info.width, vars->info.height );
+
+	// create the 'off-screen'/'in CPU accessible RAM' image buffer
+	vars->image = calloc( 1, pitch * aligned_height*3/2 );
+	assert(vars->image);
+
+	// create the two GPU resources for the 'double-buffer buffers'
+	vars->resource0 = vc_dispmanx_resource_create( type,
+			pitch,
+			aligned_height,
+			&vars->vc_image_ptr0 );
+	assert( vars->resource0 );
+	vars->resource1 = vc_dispmanx_resource_create( type,
+			pitch,
+			aligned_height,
+			&vars->vc_image_ptr1 );
+	assert( vars->resource1 );
+
+	// initialise the rectangle structures
+	vc_dispmanx_rect_set( &dst_rect_res, 0, 0, w, 3*ALIGN_UP(h, 16)/2);
+	vc_dispmanx_rect_set( &src_rect, 0, 0, w << 16, h << 16 );
+	vc_dispmanx_rect_set( &dst_rect_elem,
+			( vars->info.width - w ) / 2,
+			( vars->info.height - h ) / 2,
+			w,
+			h );
+
+	// copy ('blit') the image to the first GPU buffer resource
+	ret = vc_dispmanx_resource_write_data(  vars->resource0,
+			type,
+			pitch,
+			vars->image,
+			&dst_rect_res );
+	assert( ret == 0 );
+
+	// begin display update
+	vars->update = vc_dispmanx_update_start( 10 );
+	assert( vars->update );
+
+	// create the 'window' element - based on the first buffer resource
+	vars->element = vc_dispmanx_element_add(    vars->update,
+			vars->display,
+			2000,               // layer
+			&dst_rect_elem,
+			vars->resource0,
+			&src_rect,
+			DISPMANX_PROTECTION_NONE,
+			&alpha,
+			NULL,             // clamp
+			(DISPMANX_TRANSFORM_T)VC_IMAGE_ROT0 );
+
+	// finish display update
+	ret = vc_dispmanx_update_submit_sync( vars->update );
+	assert( ret == 0 );	
+	return 0;
 }
+
+DISPMANX_RESOURCE_HANDLE_T cur_res;
+DISPMANX_RESOURCE_HANDLE_T prev_res;
+DISPMANX_RESOURCE_HANDLE_T tmp_res;
+
+void DrawFrame(AVFrame* frame) {
+	int ret, row;
+
+	uint8_t *line = (uint8_t *)gRectVars.image;
+
+	if (frame->linesize[0] == pitch) {
+		memcpy(line, frame->data[0], pitch* frame->height);
+		memcpy(line + pitch*aligned_height, frame->data[1], pitch* frame->height/4);
+		memcpy(line + pitch*aligned_height*5/4, frame->data[2], pitch* frame->height/4);
+	} else {
+		for ( row = 0; row < frame->height; row++ ) {
+			memcpy(line + row*pitch, frame->data[0] + row*frame->linesize[0], frame->width);
+		}
+
+		line += pitch*aligned_height;
+
+		for (row = 0; row < frame->height/2; row++) {
+			memcpy(line, frame->data[1] + row*frame->linesize[2], frame->width/2);
+			memcpy(line + pitch*aligned_height/4, frame->data[2]  + row*frame->linesize[2], frame->width/2);
+			line += pitch/2;
+		}
+	}
+	// blit image to the current resource
+	ret = vc_dispmanx_resource_write_data(cur_res,
+			type,
+			pitch,
+			gRectVars.image,
+			&dst_rect_res );
+	assert( ret == 0 );
+
+	// begin display update
+	gRectVars.update = vc_dispmanx_update_start( 10 );
+	assert( gRectVars.update );
+
+	// change element source to be the current resource
+	vc_dispmanx_element_change_source(gRectVars.update, gRectVars.element, cur_res );
+
+	// finish display update
+	ret = vc_dispmanx_update_submit_sync(gRectVars.update );
+	assert( ret == 0 );
+
+	// swap current resource
+	tmp_res = cur_res;
+	cur_res = prev_res;
+	prev_res = tmp_res;
+}
+#endif
+
+
 
 int main(int argc, char** argv) {
 	std::cout << "Program is starting now ..." << std::endl;
 	av_register_all();
-	glutInit(&argc, argv);
 	ws_w = 640;
 	ws_h = 360;
+#ifdef USING_OPENGL
+	glutInit(&argc, argv);
 	glutInitWindowSize(ws_w, ws_h);
 	int window = glutCreateWindow("Sample");
 	glutReshapeFunc(reshape);
 	InitGL();
-
+#endif
 	AVFormatContext* input = NULL;
 	const AVCodec *codec;
 	AVCodecParserContext *parser;
@@ -433,11 +607,6 @@ int main(int argc, char** argv) {
 							else if (ret < 0) {
 								break;
 							}
-
-							int justifiedHeight;
-							ret = RenderAVFrame(frame, justifiedHeight);
-							if (ret < 0)
-								break;
 						} // end of while ret >= 0
 					} // end of pkt->size > 0
 				} // end of while data_size > 0
@@ -445,13 +614,19 @@ int main(int argc, char** argv) {
 		} // end of if
 
 		std::cout << "Got frame with resolution = " << w << 'x' << h << std::endl;
-
+#ifndef USING_OPENGL
+		OpenDisplay(w,h);
+		cur_res = gRectVars.resource1;
+		prev_res = gRectVars.resource0;
+#endif
 		break;
 	}
 
 	// main loop
 	while (1) {
+#ifdef USING_OPENGL
 		glutMainLoopEvent(); // detect glut event
+#endif
 		ret = av_read_frame(input, pkt);
 
 		if (ret != 0) {
@@ -500,13 +675,15 @@ int main(int argc, char** argv) {
 						else if (ret < 0) {
 							break;
 						}
-
+#ifdef USING_OPENGL
 						int justifiedHeight;
 						ret = RenderAVFrame(frame, justifiedHeight);
 						if (ret < 0)
 							break;
-
 						DrawGLScene();
+#else
+						DrawFrame(frame);
+#endif
 					} // end of while ret >= 0
 				} // end of pkt->size > 0
 			}
@@ -514,6 +691,8 @@ int main(int argc, char** argv) {
 	}
 
 	std::cout << "Program exit now" << std::endl;
+#ifdef USING_OPENGL
 	glutDestroyWindow(window);
+#endif
 	return 0;
 }
